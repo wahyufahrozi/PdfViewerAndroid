@@ -28,6 +28,8 @@ import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.io.File
+import java.io.FileOutputStream
 import java.text.DateFormat
 import java.util.Date
 import java.util.concurrent.ExecutorService
@@ -37,10 +39,12 @@ import kotlin.math.min
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
+    private lateinit var pageIndicator: TextView
     private lateinit var recycler: RecyclerView
     private lateinit var historyScroll: ScrollView
     private lateinit var historyList: LinearLayout
     private lateinit var historyButton: Button
+    private lateinit var zoomControls: LinearLayout
 
     private var renderer: PdfRenderer? = null
     private var fileDescriptor: ParcelFileDescriptor? = null
@@ -51,7 +55,8 @@ class MainActivity : AppCompatActivity() {
     private data class RecentPdf(
         val uri: String,
         val name: String,
-        val openedAt: Long
+        val openedAt: Long,
+        val localPath: String = ""
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -110,7 +115,7 @@ class MainActivity : AppCompatActivity() {
         historyButton = Button(this).apply {
             text = "Riwayat"
             isAllCaps = false
-            visibility = View.GONE
+            visibility = View.VISIBLE
             setOnClickListener { showHistory() }
         }
         header.addView(historyButton)
@@ -129,7 +134,50 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.rgb(65, 75, 88))
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
-        root.addView(status)
+        pageIndicator = TextView(this).apply {
+            text = ""
+            textSize = 14f
+            setTextColor(Color.rgb(65, 75, 88))
+            gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            setPadding(dp(8), dp(12), dp(16), dp(12))
+        }
+        val documentInfo = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(status, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pageIndicator, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        root.addView(documentInfo)
+
+        zoomControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            setPadding(dp(8), dp(2), dp(8), dp(6))
+        }
+        val zoomOutButton = Button(this).apply {
+            text = "−"
+            textSize = 22f
+            contentDescription = "Perkecil tampilan PDF"
+            setOnClickListener { zoomVisiblePages(0.8f) }
+        }
+        val zoomResetButton = Button(this).apply {
+            text = "Reset"
+            isAllCaps = false
+            setOnClickListener { resetVisiblePagesZoom() }
+        }
+        val zoomInButton = Button(this).apply {
+            text = "+"
+            textSize = 22f
+            contentDescription = "Perbesar tampilan PDF"
+            setOnClickListener { zoomVisiblePages(1.25f) }
+        }
+        zoomControls.addView(zoomOutButton)
+        zoomControls.addView(zoomResetButton)
+        zoomControls.addView(zoomInButton)
+        root.addView(zoomControls)
 
         historyScroll = ScrollView(this)
         historyList = LinearLayout(this).apply {
@@ -148,6 +196,11 @@ class MainActivity : AppCompatActivity() {
             clipToPadding = false
             setPadding(0, dp(8), 0, dp(12))
         }
+        recycler.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                updatePageIndicator()
+            }
+        })
         root.addView(recycler, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
         ))
@@ -183,8 +236,15 @@ class MainActivity : AppCompatActivity() {
     private fun openPdf(uri: Uri) {
         try {
             closePdf()
-            val descriptor = contentResolver.openFileDescriptor(uri, "r")
-                ?: throw IOException("Dokumen tidak dapat dibuka.")
+            val name = displayName(uri)
+            val localFile = copyPdfToPrivateStorage(uri, name)
+            val descriptor = if (localFile != null) {
+                ParcelFileDescriptor.open(localFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            } else {
+                contentResolver.openFileDescriptor(uri, "r")
+                    ?: throw IOException("Dokumen tidak dapat dibuka.")
+            }
+
             val newRenderer = PdfRenderer(descriptor)
             fileDescriptor = descriptor
             renderer = newRenderer
@@ -193,10 +253,12 @@ class MainActivity : AppCompatActivity() {
             recycler.visibility = View.VISIBLE
             historyScroll.visibility = View.GONE
             historyButton.visibility = View.VISIBLE
+            zoomControls.visibility = View.VISIBLE
 
-            val name = displayName(uri)
-            status.text = "${newRenderer.pageCount} halaman • $name"
-            saveHistory(uri, name)
+            status.text = name
+            pageIndicator.text = "1/${newRenderer.pageCount}"
+            saveHistory(uri, name, localFile?.absolutePath ?: "")
+            recycler.post { updatePageIndicator() }
         } catch (e: Exception) {
             closePdf()
             Toast.makeText(
@@ -208,12 +270,71 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openPdfFromHistory(item: RecentPdf) {
+        try {
+            val local = item.localPath.takeIf { it.isNotBlank() }?.let { File(it) }
+            if (local != null && local.exists()) {
+                closePdf()
+                val descriptor = ParcelFileDescriptor.open(local, ParcelFileDescriptor.MODE_READ_ONLY)
+                val newRenderer = PdfRenderer(descriptor)
+                fileDescriptor = descriptor
+                renderer = newRenderer
+                recycler.adapter = PdfPageAdapter(newRenderer, executor)
+                recycler.scrollToPosition(0)
+                recycler.visibility = View.VISIBLE
+                historyScroll.visibility = View.GONE
+                historyButton.visibility = View.VISIBLE
+                zoomControls.visibility = View.VISIBLE
+                status.text = item.name
+                pageIndicator.text = "1/${newRenderer.pageCount}"
+                recycler.post { updatePageIndicator() }
+                updateHistoryOpenedAt(item.uri)
+            } else {
+                openPdf(Uri.parse(item.uri))
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Dokumen riwayat tidak dapat dibuka: ${e.message}", Toast.LENGTH_LONG).show()
+            removeHistory(item.uri)
+        }
+    }
+
+    private fun copyPdfToPrivateStorage(uri: Uri, name: String): File? {
+        return try {
+            val directory = File(filesDir, "recent_pdfs").apply { mkdirs() }
+            val safeName = name.replace(Regex("[^A-Za-z0-9._-]"), "_").take(70)
+                .ifBlank { "document.pdf" }
+            val target = File(directory, "${uri.toString().hashCode().toUInt().toString(16)}_$safeName")
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(target).use { output -> input.copyTo(output) }
+            } ?: return null
+            target
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun updateHistoryOpenedAt(uri: String) {
+        val item = loadHistory().firstOrNull { it.uri == uri } ?: return
+        saveHistory(Uri.parse(item.uri), item.name, item.localPath)
+    }
+
+    private fun updatePageIndicator() {
+        val layout = recycler.layoutManager as? LinearLayoutManager ?: return
+        val first = layout.findFirstVisibleItemPosition()
+        val count = renderer?.pageCount ?: 0
+        if (first != RecyclerView.NO_POSITION && count > 0) {
+            pageIndicator.text = "${first + 1}/$count"
+        }
+    }
+
     private fun showHistory() {
         closePdf()
         recycler.visibility = View.GONE
         historyScroll.visibility = View.VISIBLE
-        historyButton.visibility = View.GONE
-        status.text = "Dokumen yang terakhir dibuka."
+        historyButton.visibility = View.VISIBLE
+        zoomControls.visibility = View.GONE
+        status.text = "Riwayat dokumen"
+        pageIndicator.text = ""
         renderHistory()
     }
 
@@ -221,16 +342,40 @@ class MainActivity : AppCompatActivity() {
         var name: String? = null
         var cursor: Cursor? = null
         try {
-            cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            // Query semua kolom karena beberapa File Manager tidak mendukung
+            // projection OpenableColumns.DISPLAY_NAME secara langsung.
+            cursor = contentResolver.query(uri, null, null, null, null)
             if (cursor != null && cursor.moveToFirst()) {
-                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (index >= 0) name = cursor.getString(index)
+                val candidateColumns = listOf(
+                    OpenableColumns.DISPLAY_NAME,
+                    "_display_name",
+                    "display_name",
+                    "title",
+                    "name"
+                )
+                for (column in candidateColumns) {
+                    val index = cursor.getColumnIndex(column)
+                    if (index >= 0) {
+                        val value = cursor.getString(index)
+                        if (!value.isNullOrBlank()) {
+                            name = value
+                            break
+                        }
+                    }
+                }
             }
         } catch (_: Exception) {
         } finally {
             cursor?.close()
         }
-        return name ?: uri.lastPathSegment?.substringAfterLast('/') ?: "Dokumen PDF"
+
+        if (name.isNullOrBlank()) name = intent.getStringExtra(Intent.EXTRA_TITLE)
+        if (name.isNullOrBlank()) {
+            name = uri.lastPathSegment
+                ?.substringAfterLast('/')
+                ?.takeIf { it.contains('.') && !it.startsWith("document:") }
+        }
+        return name?.takeIf { it.isNotBlank() } ?: "Dokumen PDF"
     }
 
     private fun loadHistory(): MutableList<RecentPdf> {
@@ -244,7 +389,8 @@ class MainActivity : AppCompatActivity() {
                     RecentPdf(
                         item.optString("uri"),
                         item.optString("name", "Dokumen PDF"),
-                        item.optLong("openedAt")
+                        item.optLong("openedAt"),
+                        item.optString("localPath", "")
                     )
                 )
             }
@@ -254,10 +400,10 @@ class MainActivity : AppCompatActivity() {
         return result.sortedByDescending { it.openedAt }.toMutableList()
     }
 
-    private fun saveHistory(uri: Uri, name: String) {
+    private fun saveHistory(uri: Uri, name: String, localPath: String) {
         val items = loadHistory()
         items.removeAll { it.uri == uri.toString() }
-        items.add(0, RecentPdf(uri.toString(), name, System.currentTimeMillis()))
+        items.add(0, RecentPdf(uri.toString(), name, System.currentTimeMillis(), localPath))
         val array = JSONArray()
         items.take(20).forEach { item ->
             array.put(
@@ -265,7 +411,12 @@ class MainActivity : AppCompatActivity() {
                     .put("uri", item.uri)
                     .put("name", item.name)
                     .put("openedAt", item.openedAt)
+                    .put("localPath", item.localPath)
             )
+        }
+        val retainedPaths = items.take(20).map { it.localPath }.filter { it.isNotBlank() }.toSet()
+        File(filesDir, "recent_pdfs").listFiles()?.forEach { file ->
+            if (file.absolutePath !in retainedPaths) file.delete()
         }
         prefs.edit().putString("recent_pdfs", array.toString()).apply()
         renderHistory()
@@ -273,14 +424,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun removeHistory(uri: String) {
         val array = JSONArray()
+        val removed = loadHistory().firstOrNull { it.uri == uri }
         loadHistory().filterNot { it.uri == uri }.forEach { item ->
             array.put(
                 JSONObject()
                     .put("uri", item.uri)
                     .put("name", item.name)
                     .put("openedAt", item.openedAt)
+                    .put("localPath", item.localPath)
             )
         }
+        removed?.localPath?.takeIf { it.isNotBlank() }?.let { File(it).delete() }
         prefs.edit().putString("recent_pdfs", array.toString()).apply()
         renderHistory()
     }
@@ -338,13 +492,13 @@ class MainActivity : AppCompatActivity() {
             }
             details.addView(name)
             details.addView(date)
-            details.setOnClickListener { openPdf(Uri.parse(item.uri)) }
+            details.setOnClickListener { openPdfFromHistory(item) }
             card.addView(details, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
             val open = Button(this).apply {
                 text = "Buka"
                 isAllCaps = false
-                setOnClickListener { openPdf(Uri.parse(item.uri)) }
+                setOnClickListener { openPdfFromHistory(item) }
             }
             card.addView(open)
 
@@ -367,6 +521,20 @@ class MainActivity : AppCompatActivity() {
             historyList.addView(space, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(8)
             ))
+        }
+    }
+
+    private fun zoomVisiblePages(factor: Float) {
+        for (i in 0 until recycler.childCount) {
+            val child = recycler.getChildAt(i)
+            if (child is ZoomableImageView) child.zoomBy(factor)
+        }
+    }
+
+    private fun resetVisiblePagesZoom() {
+        for (i in 0 until recycler.childCount) {
+            val child = recycler.getChildAt(i)
+            if (child is ZoomableImageView) child.resetZoom()
         }
     }
 
@@ -455,24 +623,38 @@ private class ZoomableImageView(context: android.content.Context) :
     AppCompatImageView(context) {
 
     private val drawMatrix = Matrix()
-    private val baseMatrix = Matrix()
     private var zoom = 1f
     private var lastX = 0f
     private var lastY = 0f
+    private var activePointerId = MotionEvent.INVALID_POINTER_ID
 
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                return true
+            }
+
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val nextZoom = (zoom * detector.scaleFactor).coerceIn(1f, 5f)
                 val factor = nextZoom / zoom
                 if (factor != 1f) {
-                    drawMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
+                    drawMatrix.postScale(
+                        factor, factor,
+                        detector.focusX, detector.focusY
+                    )
                     zoom = nextZoom
-                    if (zoom <= 1.02f) resetZoom()
-                    else imageMatrix = drawMatrix
+                    imageMatrix = drawMatrix
                 }
                 return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                if (zoom <= 1.01f) {
+                    resetZoom()
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                }
             }
         }
     )
@@ -480,34 +662,47 @@ private class ZoomableImageView(context: android.content.Context) :
     init {
         scaleType = ScaleType.MATRIX
         isClickable = true
+        isFocusable = true
+        adjustViewBounds = true
     }
 
     fun setZoomBitmap(bitmap: Bitmap) {
         setImageBitmap(bitmap)
+        requestLayout()
         post { resetZoom() }
     }
 
-    private fun resetZoom() {
-        val d = drawable ?: return
-        if (width <= 0 || height <= 0) return
-        val imageWidth = d.intrinsicWidth.toFloat()
-        val imageHeight = d.intrinsicHeight.toFloat()
-        if (imageWidth <= 0f || imageHeight <= 0f) return
+    fun zoomBy(factor: Float) {
+        val nextZoom = (zoom * factor).coerceIn(1f, 5f)
+        val actualFactor = nextZoom / zoom
+        if (actualFactor == 1f) return
 
-        val fit = min(width / imageWidth, height / imageHeight)
-        baseMatrix.setScale(fit, fit)
-        baseMatrix.postTranslate(
-            (width - imageWidth * fit) / 2f,
-            (height - imageHeight * fit) / 2f
-        )
-        drawMatrix.set(baseMatrix)
+        val pivotX = (width - paddingLeft - paddingRight) / 2f + paddingLeft
+        val pivotY = (height - paddingTop - paddingBottom) / 2f + paddingTop
+        drawMatrix.postScale(actualFactor, actualFactor, pivotX, pivotY)
+        zoom = nextZoom
+        imageMatrix = drawMatrix
+        parent?.requestDisallowInterceptTouchEvent(zoom > 1.01f)
+    }
+
+    fun resetZoom() {
+        val d = drawable ?: return
+        val contentWidth = width - paddingLeft - paddingRight
+        if (contentWidth <= 0 || d.intrinsicWidth <= 0) return
+
+        // Fit-to-width: halaman memenuhi lebar layar pada skala normal.
+        val fit = contentWidth.toFloat() / d.intrinsicWidth.toFloat()
+        drawMatrix.reset()
+        drawMatrix.setScale(fit, fit)
+        drawMatrix.postTranslate(paddingLeft.toFloat(), paddingTop.toFloat())
         imageMatrix = drawMatrix
         zoom = 1f
+        parent?.requestDisallowInterceptTouchEvent(false)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        resetZoom()
+        if (drawable != null) post { resetZoom() }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -515,26 +710,54 @@ private class ZoomableImageView(context: android.content.Context) :
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                activePointerId = event.getPointerId(0)
                 lastX = event.x
                 lastY = event.y
-                parent?.requestDisallowInterceptTouchEvent(false)
+                // Biarkan RecyclerView melakukan scroll vertikal pada zoom normal.
+                parent?.requestDisallowInterceptTouchEvent(zoom > 1.01f)
             }
+
             MotionEvent.ACTION_POINTER_DOWN -> {
+                // Kunci gesture dua jari agar tidak diambil alih RecyclerView.
                 parent?.requestDisallowInterceptTouchEvent(true)
             }
+
             MotionEvent.ACTION_MOVE -> {
-                if (!scaleDetector.isInProgress && zoom > 1.02f && event.pointerCount == 1) {
-                    val dx = event.x - lastX
-                    val dy = event.y - lastY
-                    drawMatrix.postTranslate(dx, dy)
+                if (!scaleDetector.isInProgress &&
+                    zoom > 1.01f &&
+                    event.pointerCount == 1
+                ) {
+                    val pointerIndex = event.findPointerIndex(activePointerId)
+                        .takeIf { it >= 0 } ?: 0
+                    val x = event.getX(pointerIndex)
+                    val y = event.getY(pointerIndex)
+                    drawMatrix.postTranslate(x - lastX, y - lastY)
                     imageMatrix = drawMatrix
+                    lastX = x
+                    lastY = y
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                } else if (event.pointerCount >= 2) {
                     parent?.requestDisallowInterceptTouchEvent(true)
                 }
-                lastX = event.x
-                lastY = event.y
             }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                val liftedIndex = event.actionIndex
+                val liftedId = event.getPointerId(liftedIndex)
+                if (liftedId == activePointerId) {
+                    val replacementIndex = if (liftedIndex == 0) 1 else 0
+                    if (replacementIndex < event.pointerCount) {
+                        activePointerId = event.getPointerId(replacementIndex)
+                        lastX = event.getX(replacementIndex)
+                        lastY = event.getY(replacementIndex)
+                    }
+                }
+                parent?.requestDisallowInterceptTouchEvent(zoom > 1.01f)
+            }
+
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                parent?.requestDisallowInterceptTouchEvent(false)
+                activePointerId = MotionEvent.INVALID_POINTER_ID
+                parent?.requestDisallowInterceptTouchEvent(zoom > 1.01f)
             }
         }
         return true
