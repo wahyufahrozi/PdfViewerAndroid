@@ -3,6 +3,9 @@ package com.wahyu.pdfviewer
 import android.content.Intent
 import android.database.Cursor
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
@@ -40,9 +43,11 @@ import kotlin.math.min
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
 
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
+    private lateinit var mainHeader: LinearLayout
     private lateinit var status: TextView
     private lateinit var pageIndicator: TextView
     private lateinit var recycler: RecyclerView
@@ -53,7 +58,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var searchPanel: LinearLayout
     private lateinit var searchInput: EditText
     private lateinit var searchStatus: TextView
-    private var searchMatches: List<Int> = emptyList()
+    private data class SearchPageResult(val pageIndex: Int, val highlights: List<RectF>)
+    private var searchMatches: List<SearchPageResult> = emptyList()
     private var searchMatchIndex: Int = -1
     private var currentPdfLocalFile: File? = null
 
@@ -109,7 +115,7 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.rgb(242, 245, 249))
         }
 
-        val header = LinearLayout(this).apply {
+        mainHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -122,7 +128,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
-        header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        mainHeader.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         historyButton = Button(this).apply {
             text = "☰"
@@ -131,7 +137,7 @@ class MainActivity : AppCompatActivity() {
             visibility = View.VISIBLE
             setOnClickListener { showHistory() }
         }
-        header.addView(historyButton)
+        mainHeader.addView(historyButton)
 
         val searchToggle = Button(this).apply {
             text = "⌕"
@@ -146,15 +152,15 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        header.addView(searchToggle)
+        mainHeader.addView(searchToggle)
 
         val openButton = Button(this).apply {
             text = "Buka"
             isAllCaps = false
             setOnClickListener { choosePdf() }
         }
-        header.addView(openButton)
-        root.addView(header)
+        mainHeader.addView(openButton)
+        root.addView(mainHeader)
 
         status = TextView(this).apply {
             text = "Pilih dokumen PDF untuk mulai membaca."
@@ -189,6 +195,16 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(Color.rgb(52, 52, 52))
             setPadding(dp(4), dp(0), dp(4), dp(4))
         }
+        val readerSearchButton = Button(this).apply {
+            text = "Cari"
+            isAllCaps = false
+            contentDescription = "Tampilkan pencarian PDF"
+            setOnClickListener {
+                searchPanel.visibility =
+                    if (searchPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                if (searchPanel.visibility == View.VISIBLE) searchInput.requestFocus()
+            }
+        }
         val zoomOutButton = Button(this).apply {
             text = "−"
             textSize = 22f
@@ -206,6 +222,7 @@ class MainActivity : AppCompatActivity() {
             contentDescription = "Perbesar tampilan PDF"
             setOnClickListener { zoomVisiblePages(1.25f) }
         }
+        zoomControls.addView(readerSearchButton)
         zoomControls.addView(zoomOutButton)
         zoomControls.addView(zoomResetButton)
         zoomControls.addView(zoomInButton)
@@ -333,6 +350,7 @@ class MainActivity : AppCompatActivity() {
             recycler.scrollToPosition(0)
             recycler.visibility = View.VISIBLE
             historyScroll.visibility = View.GONE
+            mainHeader.visibility = View.GONE
             historyButton.visibility = View.VISIBLE
             zoomControls.visibility = View.VISIBLE
 
@@ -360,6 +378,9 @@ class MainActivity : AppCompatActivity() {
                 searchPanel.visibility = View.GONE
                 searchMatches = emptyList()
                 searchMatchIndex = -1
+                searchStatus.text = ""
+                searchMatches = emptyList()
+                searchMatchIndex = -1
                 val descriptor = ParcelFileDescriptor.open(local, ParcelFileDescriptor.MODE_READ_ONLY)
                 val newRenderer = PdfRenderer(descriptor)
                 fileDescriptor = descriptor
@@ -368,6 +389,7 @@ class MainActivity : AppCompatActivity() {
                 recycler.scrollToPosition(0)
                 recycler.visibility = View.VISIBLE
                 historyScroll.visibility = View.GONE
+                mainHeader.visibility = View.GONE
                 historyButton.visibility = View.VISIBLE
                 zoomControls.visibility = View.VISIBLE
                 status.text = item.name
@@ -427,19 +449,75 @@ class MainActivity : AppCompatActivity() {
         searchStatus.text = "Mencari..."
         searchMatches = emptyList()
         searchMatchIndex = -1
+        (recycler.adapter as? PdfPageAdapter)?.setSearchHighlights(emptyMap())
 
         executor.execute {
-            val pages = mutableListOf<Int>()
+            val results = mutableListOf<SearchPageResult>()
             var failure: String? = null
             try {
                 PDDocument.load(pdfFile).use { document ->
-                    val stripper = PDFTextStripper()
                     for (pageNumber in 1..document.numberOfPages) {
-                        stripper.startPage = pageNumber
-                        stripper.endPage = pageNumber
-                        val pageText = stripper.getText(document)
-                        if (pageText.contains(query, ignoreCase = true)) {
-                            pages.add(pageNumber - 1)
+                        val positions = mutableListOf<TextPosition>()
+                        val stripper = object : PDFTextStripper() {
+                            init {
+                                startPage = pageNumber
+                                endPage = pageNumber
+                            }
+                            override fun processTextPosition(text: TextPosition) {
+                                positions.add(text)
+                                super.processTextPosition(text)
+                            }
+                        }
+                        stripper.getText(document)
+
+                        // Susun teks sesuai urutan posisi karakter, lalu petakan
+                        // setiap karakter kembali ke kotak posisi PDF-nya.
+                        // Normalisasi spasi agar frasa tetap ditemukan ketika PDF
+                        // menyimpan jarak antarkata sebagai posisi, bukan karakter spasi.
+                        val normalizedText = StringBuilder()
+                        val charPositions = mutableListOf<TextPosition>()
+                        for (position in positions) {
+                            val unicode = position.unicode ?: continue
+                            for (character in unicode) {
+                                if (!character.isWhitespace()) {
+                                    normalizedText.append(character.lowercaseChar())
+                                    charPositions.add(position)
+                                }
+                            }
+                        }
+
+                        val normalizedQuery = query.filterNot { it.isWhitespace() }.lowercase()
+                        val fullText = normalizedText.toString()
+                        val foundRects = mutableListOf<RectF>()
+                        var fromIndex = 0
+                        while (fromIndex <= fullText.length - normalizedQuery.length) {
+                            val matchAt = fullText.indexOf(normalizedQuery, fromIndex)
+                            if (matchAt < 0) break
+
+                            val pageWidth = document.getPage(pageNumber - 1).mediaBox.width
+                            val pageHeight = document.getPage(pageNumber - 1).mediaBox.height
+                            val seen = HashSet<TextPosition>()
+                            for (charIndex in matchAt until (matchAt + normalizedQuery.length).coerceAtMost(charPositions.size)) {
+                                val position = charPositions[charIndex]
+                                if (!seen.add(position)) continue
+                                val left = position.xDirAdj
+                                val top = position.yDirAdj - position.heightDir
+                                val right = left + position.widthDirAdj
+                                val bottom = position.yDirAdj
+                                foundRects.add(
+                                    RectF(
+                                        (left / pageWidth).coerceIn(0f, 1f),
+                                        (top / pageHeight).coerceIn(0f, 1f),
+                                        (right / pageWidth).coerceIn(0f, 1f),
+                                        (bottom / pageHeight).coerceIn(0f, 1f)
+                                    )
+                                )
+                            }
+                            fromIndex = matchAt + normalizedQuery.length
+                        }
+
+                        if (foundRects.isNotEmpty()) {
+                            results.add(SearchPageResult(pageNumber - 1, foundRects))
                         }
                     }
                 }
@@ -451,13 +529,15 @@ class MainActivity : AppCompatActivity() {
                 if (failure != null) {
                     searchStatus.text = "Pencarian gagal"
                     Toast.makeText(this, "Pencarian teks gagal: $failure", Toast.LENGTH_LONG).show()
-                } else if (pages.isEmpty()) {
+                } else if (results.isEmpty()) {
                     searchMatches = emptyList()
                     searchStatus.text = "Tidak ditemukan"
                 } else {
-                    searchMatches = pages
+                    searchMatches = results
                     searchMatchIndex = 0
-                    searchStatus.text = "1/${pages.size}"
+                    val highlightMap = results.associate { it.pageIndex to it.highlights }
+                    (recycler.adapter as? PdfPageAdapter)?.setSearchHighlights(highlightMap)
+                    searchStatus.text = "1/${results.size}"
                     goToSearchMatch()
                 }
             }
@@ -472,16 +552,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun goToSearchMatch() {
-        val page = searchMatches.getOrNull(searchMatchIndex) ?: return
+        val result = searchMatches.getOrNull(searchMatchIndex) ?: return
         (recycler.layoutManager as? LinearLayoutManager)
-            ?.scrollToPositionWithOffset(page, dp(8))
-        pageIndicator.text = "${page + 1}/${renderer?.pageCount ?: 0}"
+            ?.scrollToPositionWithOffset(result.pageIndex, dp(8))
+        pageIndicator.text = "${result.pageIndex + 1}/${renderer?.pageCount ?: 0}"
     }
 
     private fun showHistory() {
         closePdf()
         recycler.visibility = View.GONE
         historyScroll.visibility = View.VISIBLE
+        mainHeader.visibility = View.VISIBLE
         historyButton.visibility = View.VISIBLE
         zoomControls.visibility = View.GONE
         searchPanel.visibility = View.GONE
@@ -702,6 +783,15 @@ class MainActivity : AppCompatActivity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
+    @Deprecated("Use OnBackPressedDispatcher in a future update")
+    override fun onBackPressed() {
+        if (::recycler.isInitialized && recycler.visibility == View.VISIBLE) {
+            showHistory()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
     override fun onDestroy() {
         closePdf()
         executor.shutdown()
@@ -715,6 +805,13 @@ private class PdfPageAdapter(
 ) : RecyclerView.Adapter<PdfPageAdapter.PageHolder>() {
 
     class PageHolder(val image: ZoomableImageView) : RecyclerView.ViewHolder(image)
+
+    private var searchHighlights: Map<Int, List<RectF>> = emptyMap()
+
+    fun setSearchHighlights(highlights: Map<Int, List<RectF>>) {
+        searchHighlights = highlights
+        notifyDataSetChanged()
+    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageHolder {
         val image = ZoomableImageView(parent.context).apply {
@@ -736,6 +833,7 @@ private class PdfPageAdapter(
 
     override fun onBindViewHolder(holder: PageHolder, position: Int) {
         holder.image.tag = position
+        holder.image.setHighlights(searchHighlights[position].orEmpty())
         holder.image.setImageDrawable(null)
         val displayWidth = holder.image.resources.displayMetrics.widthPixels
         val targetWidth = (displayWidth * 2).coerceIn(1200, 3000)
@@ -780,6 +878,37 @@ private class ZoomableImageView(context: android.content.Context) :
     private var lastX = 0f
     private var lastY = 0f
     private var activePointerId = MotionEvent.INVALID_POINTER_ID
+    private var highlightRects: List<RectF> = emptyList()
+    private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(115, 255, 220, 0)
+        style = Paint.Style.FILL
+    }
+
+    fun setHighlights(rects: List<RectF>) {
+        highlightRects = rects
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val d = drawable ?: return
+        if (highlightRects.isEmpty()) return
+
+        val bitmapWidth = d.intrinsicWidth.toFloat()
+        val bitmapHeight = d.intrinsicHeight.toFloat()
+        if (bitmapWidth <= 0f || bitmapHeight <= 0f) return
+
+        for (normalized in highlightRects) {
+            val rect = RectF(
+                normalized.left * bitmapWidth,
+                normalized.top * bitmapHeight,
+                normalized.right * bitmapWidth,
+                normalized.bottom * bitmapHeight
+            )
+            drawMatrix.mapRect(rect)
+            canvas.drawRoundRect(rect, 3f, 3f, highlightPaint)
+        }
+    }
 
     private val scaleDetector = ScaleGestureDetector(
         context,
