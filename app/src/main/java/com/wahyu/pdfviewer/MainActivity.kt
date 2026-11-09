@@ -16,7 +16,9 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ImageView
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -35,6 +37,9 @@ import java.util.Date
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.min
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 
 class MainActivity : AppCompatActivity() {
     private lateinit var root: LinearLayout
@@ -45,6 +50,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var historyList: LinearLayout
     private lateinit var historyButton: Button
     private lateinit var zoomControls: LinearLayout
+    private lateinit var searchPanel: LinearLayout
+    private lateinit var searchInput: EditText
+    private lateinit var searchStatus: TextView
+    private var searchMatches: List<Int> = emptyList()
+    private var searchMatchIndex: Int = -1
+    private var currentPdfLocalFile: File? = null
 
     private var renderer: PdfRenderer? = null
     private var fileDescriptor: ParcelFileDescriptor? = null
@@ -61,6 +72,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PDFBoxResourceLoader.init(applicationContext)
         buildScreen()
         renderHistory()
         handleIncomingPdf(intent)
@@ -100,28 +112,44 @@ class MainActivity : AppCompatActivity() {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), dp(12), dp(18), dp(12))
-            setBackgroundColor(Color.rgb(16, 54, 92))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(Color.rgb(52, 52, 52))
         }
 
         val title = TextView(this).apply {
             text = "PDF Viewer"
-            textSize = 22f
+            textSize = 17f
             setTextColor(Color.WHITE)
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         historyButton = Button(this).apply {
-            text = "Riwayat"
+            text = "☰"
+            textSize = 20f
             isAllCaps = false
             visibility = View.VISIBLE
             setOnClickListener { showHistory() }
         }
         header.addView(historyButton)
 
+        val searchToggle = Button(this).apply {
+            text = "⌕"
+            textSize = 20f
+            isAllCaps = false
+            setOnClickListener {
+                if (recycler.visibility == View.VISIBLE) {
+                    searchPanel.visibility = if (searchPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    if (searchPanel.visibility == View.VISIBLE) searchInput.requestFocus()
+                } else {
+                    Toast.makeText(this@MainActivity, "Buka PDF terlebih dahulu.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        header.addView(searchToggle)
+
         val openButton = Button(this).apply {
-            text = "Buka PDF"
+            text = "Buka"
             isAllCaps = false
             setOnClickListener { choosePdf() }
         }
@@ -131,19 +159,22 @@ class MainActivity : AppCompatActivity() {
         status = TextView(this).apply {
             text = "Pilih dokumen PDF untuk mulai membaca."
             textSize = 14f
-            setTextColor(Color.rgb(65, 75, 88))
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), dp(8), dp(4), dp(8))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
         }
         pageIndicator = TextView(this).apply {
             text = ""
             textSize = 14f
-            setTextColor(Color.rgb(65, 75, 88))
-            gravity = Gravity.CENTER_VERTICAL or Gravity.END
-            setPadding(dp(8), dp(12), dp(16), dp(12))
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(8), dp(10), dp(8))
         }
         val documentInfo = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.rgb(52, 52, 52))
             addView(status, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(pageIndicator, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -155,7 +186,8 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             visibility = View.GONE
-            setPadding(dp(8), dp(2), dp(8), dp(6))
+            setBackgroundColor(Color.rgb(52, 52, 52))
+            setPadding(dp(4), dp(0), dp(4), dp(4))
         }
         val zoomOutButton = Button(this).apply {
             text = "−"
@@ -178,6 +210,50 @@ class MainActivity : AppCompatActivity() {
         zoomControls.addView(zoomResetButton)
         zoomControls.addView(zoomInButton)
         root.addView(zoomControls)
+
+        searchPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setBackgroundColor(Color.rgb(52, 52, 52))
+            setPadding(dp(8), dp(4), dp(8), dp(8))
+        }
+        searchInput = EditText(this).apply {
+            hint = "Cari dalam PDF"
+            singleLine = true
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.LTGRAY)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            setBackgroundColor(Color.rgb(75, 75, 75))
+        }
+        searchPanel.addView(searchInput, LinearLayout.LayoutParams(0, dp(42), 1f))
+        val findButton = Button(this).apply {
+            text = "Cari"
+            isAllCaps = false
+            setOnClickListener { searchInPdf() }
+        }
+        searchPanel.addView(findButton)
+        val previousButton = Button(this).apply {
+            text = "↑"
+            contentDescription = "Hasil sebelumnya"
+            setOnClickListener { moveSearchResult(-1) }
+        }
+        searchPanel.addView(previousButton)
+        val nextButton = Button(this).apply {
+            text = "↓"
+            contentDescription = "Hasil berikutnya"
+            setOnClickListener { moveSearchResult(1) }
+        }
+        searchPanel.addView(nextButton)
+        searchStatus = TextView(this).apply {
+            text = ""
+            textSize = 11f
+            setTextColor(Color.WHITE)
+            setPadding(dp(6), 0, dp(4), 0)
+        }
+        searchPanel.addView(searchStatus)
+        root.addView(searchPanel)
 
         historyScroll = ScrollView(this)
         historyList = LinearLayout(this).apply {
@@ -238,6 +314,11 @@ class MainActivity : AppCompatActivity() {
             closePdf()
             val name = displayName(uri)
             val localFile = copyPdfToPrivateStorage(uri, name)
+            currentPdfLocalFile = localFile
+            searchPanel.visibility = View.GONE
+            searchMatches = emptyList()
+            searchMatchIndex = -1
+            searchStatus.text = ""
             val descriptor = if (localFile != null) {
                 ParcelFileDescriptor.open(localFile, ParcelFileDescriptor.MODE_READ_ONLY)
             } else {
@@ -275,6 +356,10 @@ class MainActivity : AppCompatActivity() {
             val local = item.localPath.takeIf { it.isNotBlank() }?.let { File(it) }
             if (local != null && local.exists()) {
                 closePdf()
+                currentPdfLocalFile = local
+                searchPanel.visibility = View.GONE
+                searchMatches = emptyList()
+                searchMatchIndex = -1
                 val descriptor = ParcelFileDescriptor.open(local, ParcelFileDescriptor.MODE_READ_ONLY)
                 val newRenderer = PdfRenderer(descriptor)
                 fileDescriptor = descriptor
@@ -327,12 +412,79 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun searchInPdf() {
+        val query = searchInput.text.toString().trim()
+        val pdfFile = currentPdfLocalFile
+        if (query.isEmpty()) {
+            searchStatus.text = "Masukkan kata"
+            return
+        }
+        if (pdfFile == null || !pdfFile.exists()) {
+            searchStatus.text = "File tidak tersedia"
+            return
+        }
+
+        searchStatus.text = "Mencari..."
+        searchMatches = emptyList()
+        searchMatchIndex = -1
+
+        executor.execute {
+            val pages = mutableListOf<Int>()
+            var failure: String? = null
+            try {
+                PDDocument.load(pdfFile).use { document ->
+                    val stripper = PDFTextStripper()
+                    for (pageNumber in 1..document.numberOfPages) {
+                        stripper.startPage = pageNumber
+                        stripper.endPage = pageNumber
+                        val pageText = stripper.getText(document)
+                        if (pageText.contains(query, ignoreCase = true)) {
+                            pages.add(pageNumber - 1)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                failure = e.message ?: "PDF tidak dapat dibaca"
+            }
+
+            runOnUiThread {
+                if (failure != null) {
+                    searchStatus.text = "Pencarian gagal"
+                    Toast.makeText(this, "Pencarian teks gagal: $failure", Toast.LENGTH_LONG).show()
+                } else if (pages.isEmpty()) {
+                    searchMatches = emptyList()
+                    searchStatus.text = "Tidak ditemukan"
+                } else {
+                    searchMatches = pages
+                    searchMatchIndex = 0
+                    searchStatus.text = "1/${pages.size}"
+                    goToSearchMatch()
+                }
+            }
+        }
+    }
+
+    private fun moveSearchResult(direction: Int) {
+        if (searchMatches.isEmpty()) return
+        searchMatchIndex = (searchMatchIndex + direction + searchMatches.size) % searchMatches.size
+        searchStatus.text = "${searchMatchIndex + 1}/${searchMatches.size}"
+        goToSearchMatch()
+    }
+
+    private fun goToSearchMatch() {
+        val page = searchMatches.getOrNull(searchMatchIndex) ?: return
+        (recycler.layoutManager as? LinearLayoutManager)
+            ?.scrollToPositionWithOffset(page, dp(8))
+        pageIndicator.text = "${page + 1}/${renderer?.pageCount ?: 0}"
+    }
+
     private fun showHistory() {
         closePdf()
         recycler.visibility = View.GONE
         historyScroll.visibility = View.VISIBLE
         historyButton.visibility = View.VISIBLE
         zoomControls.visibility = View.GONE
+        searchPanel.visibility = View.GONE
         status.text = "Riwayat dokumen"
         pageIndicator.text = ""
         renderHistory()
@@ -544,6 +696,7 @@ class MainActivity : AppCompatActivity() {
         renderer = null
         fileDescriptor?.close()
         fileDescriptor = null
+        currentPdfLocalFile = null
     }
 
     private fun dp(value: Int): Int =
