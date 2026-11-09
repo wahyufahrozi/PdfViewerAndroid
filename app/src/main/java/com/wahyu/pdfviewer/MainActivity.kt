@@ -220,7 +220,7 @@ class MainActivity : AppCompatActivity() {
         }
         searchInput = EditText(this).apply {
             hint = "Cari dalam PDF"
-            singleLine = true
+            isSingleLine = true
             textSize = 14f
             setTextColor(Color.WHITE)
             setHintTextColor(Color.LTGRAY)
