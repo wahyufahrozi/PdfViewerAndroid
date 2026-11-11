@@ -1,3 +1,11 @@
 <resources>
     <style name="Theme.PdfViewer" parent="Theme.Material3.DayNight.NoActionBar" />
+
+    <style name="ToolbarTitle" parent="TextAppearance.Material3.TitleMedium">
+        <item name="android:textSize">17sp</item>
+    </style>
+
+    <style name="ToolbarSubtitle" parent="TextAppearance.Material3.LabelSmall">
+        <item name="android:textSize">11sp</item>
+    </style>
 </resources>
