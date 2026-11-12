@@ -82,6 +82,8 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import com.google.android.material.R as MaterialR
+import androidx.core.content.FileProvider
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 
 /** Satu hasil pencarian. [rects] sudah dinormalisasi (0..1) terhadap ukuran halaman. */
 data class SearchHit(val id: Int, val pageIndex: Int, val rects: List<RectF>)
@@ -117,10 +119,12 @@ private val NIGHT_FILTER = ColorMatrixColorFilter(
 
 class MainActivity : AppCompatActivity() {
 
-    private companion object {
-        const val MENU_SEARCH = 1
-        const val MENU_NIGHT = 2
-    }
+private companion object {
+    const val MENU_SEARCH = 1
+    const val MENU_NIGHT = 2
+    const val MENU_GOTO = 3
+    const val MENU_SHARE = 4
+}
 
     private lateinit var root: LinearLayout
     private lateinit var toolbar: MaterialToolbar
@@ -141,7 +145,8 @@ class MainActivity : AppCompatActivity() {
     private var currentPdfLocalFile: File? = null
     private var nightMode = false
     private var sliderDragging = false
-
+    private var pageKey: String? = null
+    private var lastPage = 0
     // --- state pencarian ---
     private var hits: List<SearchHit> = emptyList()
     private var hitsByPage: Map<Int, List<SearchHit>> = emptyMap()
@@ -297,6 +302,12 @@ class MainActivity : AppCompatActivity() {
                 setIcon(R.drawable.ic_dark_mode)
                 setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
             }
+            menu.add(Menu.NONE, MENU_GOTO, 2, "Ke halaman…").apply {
+                setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+            }
+            menu.add(Menu.NONE, MENU_SHARE, 3, "Bagikan PDF").apply {
+                setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER)
+            }
             setNavigationOnClickListener { showHistory() }
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
@@ -308,6 +319,8 @@ class MainActivity : AppCompatActivity() {
                         toggleNightMode()
                         true
                     }
+                    MENU_GOTO -> { showGoToPageDialog(); true }
+                    MENU_SHARE -> { sharePdf(); true }
                     else -> false
                 }
             }
@@ -512,6 +525,8 @@ class MainActivity : AppCompatActivity() {
             if (reading && (renderer?.pageCount ?: 0) > 1) View.VISIBLE else View.GONE
         toolbar.menu.findItem(MENU_SEARCH)?.isVisible = reading
         toolbar.menu.findItem(MENU_NIGHT)?.isVisible = reading
+        toolbar.menu.findItem(MENU_GOTO)?.isVisible = reading
+        toolbar.menu.findItem(MENU_SHARE)?.isVisible = reading
         toolbar.navigationIcon =
             if (reading) AppCompatResources.getDrawable(this, R.drawable.ic_back) else null
         if (!reading) {
@@ -550,6 +565,7 @@ class MainActivity : AppCompatActivity() {
         var page = currentPageIndex()
         if (page == RecyclerView.NO_POSITION) page = layout.findFirstVisibleItemPosition()
         if (page == RecyclerView.NO_POSITION) return
+        lastPage = page
         toolbar.subtitle = "${page + 1}/$count"
         if (!sliderDragging && pageSlider.visibility == View.VISIBLE) {
             pageSlider.value = (page + 1).toFloat().coerceIn(pageSlider.valueFrom, pageSlider.valueTo)
@@ -565,7 +581,14 @@ class MainActivity : AppCompatActivity() {
         return (recycler.layoutManager as? LinearLayoutManager)
             ?.findFirstVisibleItemPosition()?.coerceAtLeast(0) ?: 0
     }
-
+    private fun saveLastPage() {
+    val key = pageKey ?: return
+    prefs.edit().putInt(key, lastPage).apply()
+    }
+    override fun onPause() {
+    saveLastPage()
+    super.onPause()
+    }
     // ------------------------------------------------------------------ buka PDF
 
     private fun choosePdf() = pickPdf.launch(arrayOf("application/pdf"))
@@ -628,17 +651,20 @@ class MainActivity : AppCompatActivity() {
         recycler.adapter = PdfPageAdapter(
             newRenderer, executor, nightMode, pageListener
         ) { page -> onPageReady(page) }
-        recycler.scrollToPosition(0)
-
         val count = newRenderer.pageCount
-        pageSlider.valueFrom = 1f
-        pageSlider.valueTo = maxOf(2f, count.toFloat())
-        pageSlider.value = 1f
+pageKey = "page_" + (file?.absolutePath ?: name)
+val saved = prefs.getInt(pageKey!!, 0).coerceIn(0, count - 1)
+lastPage = saved
+(recycler.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(saved, 0)
 
-        setMode(true)
-        applyReadingBackground()
-        toolbar.title = name
-        toolbar.subtitle = "1/$count"
+pageSlider.valueFrom = 1f
+pageSlider.valueTo = maxOf(2f, count.toFloat())
+pageSlider.value = (saved + 1).toFloat()
+
+setMode(true)
+applyReadingBackground()
+toolbar.title = name
+toolbar.subtitle = "${saved + 1}/$count"
     }
 
     private fun showHistory() {
@@ -649,6 +675,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun closePdf() {
         if (!::recycler.isInitialized) return
+        saveLastPage()
+        pageKey = null
         resetSearchState()
         selection = null
         selectionBar.visibility = View.GONE
@@ -722,7 +750,52 @@ class MainActivity : AppCompatActivity() {
         }
         return name?.takeIf { it.isNotBlank() } ?: "Dokumen PDF"
     }
+    private fun showGoToPageDialog() {
+    val count = renderer?.pageCount ?: return
+    val input = EditText(this).apply {
+        inputType = InputType.TYPE_CLASS_NUMBER
+        hint = "1 - $count"
+        setSingleLine(true)
+    }
+    val container = FrameLayout(this).apply {
+        setPadding(dp(24), dp(8), dp(24), 0)
+        addView(input)
+    }
+    MaterialAlertDialogBuilder(this)
+        .setTitle("Ke halaman")
+        .setView(container)
+        .setPositiveButton("Buka") { _, _ ->
+            val n = input.text.toString().toIntOrNull()
+            if (n == null || n !in 1..count) {
+                Toast.makeText(this, "Masukkan angka 1 sampai $count", Toast.LENGTH_SHORT).show()
+            } else {
+                (recycler.layoutManager as? LinearLayoutManager)
+                    ?.scrollToPositionWithOffset(n - 1, 0)
+            }
+        }
+        .setNegativeButton("Batal", null)
+        .show()
+    input.requestFocus()
+}
 
+private fun sharePdf() {
+    val file = currentPdfLocalFile
+    if (file == null || !file.exists()) {
+        Toast.makeText(this, "File tidak tersedia untuk dibagikan.", Toast.LENGTH_SHORT).show()
+        return
+    }
+    try {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/pdf"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(send, "Bagikan PDF"))
+    } catch (e: Exception) {
+        Toast.makeText(this, "Gagal membagikan: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+}
     // ------------------------------------------------------------------ pilih teks
 
     private fun nearestWord(words: List<WordBox>, nx: Float, ny: Float, maxDist: Float): Int {
